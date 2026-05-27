@@ -1,3 +1,4 @@
 # Code owners for the llm-inference-server repository
 # Assign all files to the repository owner by default.
+# The repository owner is designated as root
 * @SamarjitDebnath

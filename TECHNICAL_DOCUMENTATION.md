@@ -21,19 +21,37 @@ Key capabilities:
 
 ```mermaid
 flowchart TD
-    A[Client] -->|POST /api/generate| B[FastAPI Route: api/routes.py]
-    B --> C[Create InferenceRequest]
-    C --> D["request_queue.put()"]
-    D --> E["ContinuousScheduler.run()"]
-    E --> F["_add_new_requests()"]
-    F --> G["_prepare_batch()"]
-    G --> H["InferenceEngine.forward_step()"]
-    H --> I["InferenceEngine.apply_repetition_penalty()"]
-    I --> J["Sample next token"]
-    J --> K["_dispatch_tokens()"]
-    K --> L["stream_manager.stream_response()"]
-    L -->|SSE token events| M[Client]
-    K -->|DONE| M
+    A[Client] -->|POST /generate| GEN[FastAPI: /generate]
+    A -->|POST /generate_batch| BATCH[FastAPI: /generate_batch]
+
+    GEN --> C1[Create InferenceRequest]
+    C1 --> Q1[Enqueue to request_queue]
+    Q1 --> SCHED1[ContinuousScheduler.run]
+    SCHED1 --> ADD[_add_new_requests]
+    ADD --> PREP1[_prepare_batch - tokenize and pad]
+    PREP1 --> FWD1[InferenceEngine.forward_step]
+    FWD1 --> PEN1[InferenceEngine.apply_repetition_penalty]
+    PEN1 --> SMP1[InferenceEngine.sample]
+    SMP1 --> DISP1[_dispatch_tokens]
+    DISP1 --> PUT1[push token to req queue / update state]
+    PUT1 --> STREAM1[streaming.stream_response]
+    STREAM1 -->|SSE tokens| CLIENT1[Client]
+
+    BATCH --> C2[Create InferenceRequest batch]
+    C2 --> Q2[Enqueue to batch_request_queue]
+    Q2 --> SCHED2[BatchScheduler.run]
+    SCHED2 --> COLLECT[_collect_batch]
+    COLLECT --> PROC[process_batch]
+    PROC --> ENCODE[tokenizer.encode and build tensors]
+    ENCODE --> GENB[InferenceEngine.generate_batch]
+    GENB --> SETF[Set req.future results / push DONE to queues]
+    SETF --> CLIENT2[Return BatchGenerateResponse]
+
+    subgraph startup[Server startup]
+        SRV[api/server.py]
+    end
+    SRV -->|create task| SCHED1
+    SRV -->|create task| SCHED2
 ```
 
 > The scheduler batches active requests and uses the model's `past_key_values` cache to avoid recomputing full prompts on every step.
