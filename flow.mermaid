@@ -1,0 +1,14 @@
+flowchart TD
+    A[Client] -->|POST /api/generate| B[FastAPI Route: api/routes.py]
+    B --> C[Create InferenceRequest]
+    C --> D["request_queue.put()"]
+    D --> E["ContinuousScheduler.run()"]
+    E --> F["_add_new_requests()"]
+    F --> G["_prepare_batch()"]
+    G --> H["InferenceEngine.forward_step()"]
+    H --> I["InferenceEngine.apply_repetition_penalty()"]
+    I --> J["Sample next token"]
+    J --> K["_dispatch_tokens()"]
+    K --> L["stream_manager.stream_response()"]
+    L -->|SSE token events| M[Client]
+    K -->|DONE| M

@@ -1,0 +1,15 @@
+model_config:
+   defaults:
+      model_name: "openai-community/gpt2-medium" # "distilgpt2" # you can change this to any compatible model like "gpt2-medium", "gpt2-large",  "TinyLlama/TinyLlama-1.1B-Chat-v1.0" etc.
+      device: "cpu" # for local testing, change to "cuda" if you have a compatible GPU
+      max_length: 20
+      temperature: 0.5
+      top_k: 8
+      top_p: 0.9
+      repetition_penalty: 1.2
+      num_return_sequences: 1
+
+logging_config:
+   defaults:
+      log_level: "DEBUG"
+      log_file: "logs/app.log"
