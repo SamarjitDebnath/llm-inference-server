@@ -34,7 +34,7 @@ jobs:
     
     - name: Run unit tests
       run: |
-        pytest tests/test_unit.py -v --cov=. --cov-report=xml
+        pytest tests/test_unit.py -v
     
     - name: Run integration tests
       run: |
