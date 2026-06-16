@@ -66,6 +66,74 @@ class TestBatchScheduler:
         assert metrics.token_throughputs[-1] >= 0
         mock_engine.generate_batch.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_batch_compaction_in_inference_engine(self):
+        """Test that batch compaction updates active_requests and handles early completion."""
+        try:
+            from engine.generator import InferenceEngine
+            from scheduler.request import InferenceRequest
+            from unittest.mock import MagicMock
+        except ImportError:
+            pytest.skip("InferenceEngine or InferenceRequest not available")
+
+        # Initialize engine
+        engine = InferenceEngine()
+
+        # Mock the model and its configuration
+        mock_model = MagicMock()
+        mock_model.config.eos_token_id = 50256  # GPT-2 EOS token
+        engine._model = mock_model
+
+        # Setup requests with unequal max_tokens
+        req_0 = InferenceRequest(prompt="short", max_tokens=1, temperature=0.7)
+        req_1 = InferenceRequest(prompt="longer", max_tokens=3, temperature=0.9)
+        requests = [req_0, req_1]
+
+        # Prepare input_ids and attention_mask tensors
+        input_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+        attention_mask = torch.tensor([[1, 1], [1, 1]], dtype=torch.long)
+
+        class MockModelOutput:
+            def __init__(self, logits, past_key_values):
+                self.logits = logits
+                self.past_key_values = past_key_values
+
+        mock_pkv = MagicMock()
+
+        # Mock the model calls to simulate compaction:
+        # Step 1: 2 requests active. Request 0 generates EOS (50256), Request 1 generates 100.
+        # Step 2: 1 request active (Request 1). Generates 101.
+        # Step 3: 1 request active (Request 1). Generates 102 (finishes max_tokens=3).
+        call_count = 0
+        def model_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                logits = torch.zeros((2, 1, 50257))
+                logits[0, 0, 50256] = 100.0  # Force EOS for req_0
+                logits[1, 0, 100] = 100.0    # Token 100 for req_1
+                return MockModelOutput(logits, mock_pkv)
+            elif call_count == 2:
+                logits = torch.zeros((1, 1, 50257))
+                logits[0, 0, 101] = 100.0    # Token 101 for req_1
+                return MockModelOutput(logits, mock_pkv)
+            else:
+                logits = torch.zeros((1, 1, 50257))
+                logits[0, 0, 102] = 100.0    # Token 102 for req_1
+                return MockModelOutput(logits, mock_pkv)
+
+        mock_model.side_effect = model_side_effect
+
+        outputs = await engine.generate_batch(input_ids, attention_mask, requests)
+
+        from tokenizer.tokenizer_service import tokenizer_service
+        assert len(outputs) == 2
+        assert outputs[0] == tokenizer_service.decode([50256])
+        assert outputs[1] == tokenizer_service.decode([100, 101, 102])
+        assert call_count == 3
+        mock_pkv.batch_select_indices.assert_called_once()
+
+
 
 class TestTokenizerService:
     """Unit tests for tokenizer service"""
@@ -146,6 +214,42 @@ class TestTokenizerService:
         assert request.past is not None, "Expected request KV cache to be populated after the first step"
         assert misses == 1, f"Expected exactly one cache miss, got {misses}"
         assert hits == total_steps - 1, f"Expected {total_steps - 1} cache hits, got {hits}"
+
+
+class TestStreamManager:
+    """Unit tests for the stream manager and decoding"""
+
+    @pytest.mark.asyncio
+    async def test_stream_response_handles_multi_byte_characters(self):
+        """Test that stream manager decodes multi-byte tokens across boundaries correctly."""
+        try:
+            from streaming.stream_manager import stream_response
+            from scheduler.request import InferenceRequest
+            from tokenizer.tokenizer_service import tokenizer_service
+        except ImportError:
+            pytest.skip("Required modules not available")
+
+        # Make sure tokenizer is loaded to decode properly
+        tokenizer_service.load()
+
+        # Emoji test
+        text = "Hi 😊"
+        tokens = tokenizer_service.encode(text)
+        assert len(tokens) > 1
+
+        req = InferenceRequest(prompt="test prompt", max_tokens=10, temperature=0.7)
+
+        for token in tokens:
+            req.queue.put_nowait(token)
+        req.queue.put_nowait("[DONE]")
+
+        yielded_slices = []
+        async for chunk in stream_response(req):
+            yielded_slices.append(chunk)
+
+        reconstructed = "".join(yielded_slices)
+        assert "Hi" in reconstructed
+        assert "\ufffd" not in reconstructed
 
 
 class TestAPIStructure:

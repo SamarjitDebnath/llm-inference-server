@@ -65,13 +65,31 @@ class ContinuousScheduler:
                     request_queue.get(), timeout=self.timeout
                 )
                 # Tokenise the prompt once and move tensors to the engine device
-                encoded = self.tokenizer.tokenizer(
-                    req.prompt,
+                # Apply chat template if available
+                formatted_prompt = req.prompt
+                tokenizer_obj = self.tokenizer.tokenizer
+                if hasattr(tokenizer_obj, 'apply_chat_template'):
+                    try:
+                        # Format as a single user message for chat models
+                        messages = [{"role": "user", "content": req.prompt}]
+                        formatted_prompt = tokenizer_obj.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                        logger.info("Applied chat template to prompt: %s -> %s", req.prompt[:50], formatted_prompt[:80])
+                    except Exception as e:
+                        logger.warning("Failed to apply chat template: %s, using raw prompt", e)
+                
+                encoded = tokenizer_obj(
+                    formatted_prompt,
                     return_tensors="pt",
                 )
                 req.input_ids = encoded["input_ids"].to(self.engine.device)
                 setattr(req, "attention_mask", encoded["attention_mask"].to(self.engine.device))
                 setattr(req, "past", None)  # No KV cache for the first step
+                # Track cumulative sequence length for attention mask in KV-cached passes
+                setattr(req, "seq_length", req.input_ids.shape[1])
                 self.active_requests.append(req)
                 logger.debug(
                     "Added request to scheduler: prompt=%s, active_requests=%d",
@@ -113,11 +131,36 @@ class ContinuousScheduler:
         else:
             # Subsequent steps – only the most recent token per request.
             input_tensors = [r.input_ids[:, -1:] for r in self.active_requests if r.input_ids is not None]
-            mask_tensors = [r.attention_mask[:, -1:] for r in self.active_requests if r.attention_mask is not None]
-            if not input_tensors or not mask_tensors:
+            if not input_tensors:
                 return None
             input_ids = torch.cat(input_tensors, dim=0)
-            attention_mask = torch.cat(mask_tensors, dim=0)
+            
+            # For KV-cached passes, build attention masks covering full sequence length.
+            # The model needs to attend to ALL previous tokens in context, not just the new token.
+            attention_masks = []
+            for r in self.active_requests:
+                if r.input_ids is None:
+                    continue
+                seq_len = getattr(r, 'seq_length', r.input_ids.shape[1])
+                # Create attention mask of all 1s covering full sequence
+                mask = torch.ones((1, seq_len), device=self.engine.device, dtype=torch.long)
+                attention_masks.append(mask)
+            
+            if not attention_masks:
+                return None
+            
+            # Pad attention masks to same length within batch
+            max_seq_len = max(m.shape[1] for m in attention_masks)
+            padded_masks = []
+            for m in attention_masks:
+                if m.shape[1] < max_seq_len:
+                    pad_amt = max_seq_len - m.shape[1]
+                    padded = torch.nn.functional.pad(m, (pad_amt, 0), value=0)
+                    padded_masks.append(padded)
+                else:
+                    padded_masks.append(m)
+            attention_mask = torch.cat(padded_masks, dim=0)
+            
             # Stack each layer's KV cache across the batch dimension.
             # At this point we know no request has `past is None` (checked above).
             assert all(r.past is not None for r in self.active_requests)
@@ -185,6 +228,10 @@ class ContinuousScheduler:
                 [attn, torch.ones((1, 1), dtype=attn.dtype, device=attn.device)], dim=1
             )
             setattr(req, "attention_mask", new_attn)
+            
+            # Update cumulative sequence length for KV-cached attention masks
+            current_seq_length = getattr(req, 'seq_length', 0)
+            setattr(req, 'seq_length', current_seq_length + 1)
 
             # Extract this request's slice of the new KV cache.
             # If any layer contains None, fall back to full prompt generation.

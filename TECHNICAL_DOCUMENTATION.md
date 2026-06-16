@@ -11,7 +11,9 @@ Key capabilities:
 - HTTP endpoint `/api/generate_batch` for non-streaming batch generation with request timeout and cancellation support
 - HTTP endpoint `/api/metrics` for runtime queue and batch metrics
 - Server-sent events (SSE) token streaming using `EventSourceResponse`
+- Automatic chat prompt formatting when tokenizer supports `apply_chat_template()`, with raw-prompt fallback for base models
 - Central request queue and continuous scheduler for asynchronous generation
+- Buffered token streaming that emits only at whitespace/punctuation boundaries or after a short buffer threshold
 - Pytorch model execution with configurable temperature, top-k, top-p, and repetition penalty
 - Configurable model and logging settings via YAML and `.env`
 
@@ -166,6 +168,7 @@ Imports:
 Class `ModelLoader`:
 - `self.model` is initialized as `None`.
 - `load()` checks if `self.model` is `None` and then loads the model from `model_settings.model_name`.
+- The model dtype is selected based on device: `torch.float16` for `mps`, `torch.float32` otherwise.
 - The model is moved to `model_settings.device` and switched to `eval()` mode to disable dropout.
 - `_get_model()` lazily calls `load()` if needed and returns the model instance.
 
@@ -300,9 +303,10 @@ Use case:
   - Calls `await asyncio.wait_for(request_queue.get(), timeout=self.timeout)`.
   - If the queue is empty for `self.timeout`, the method returns and the scheduler continues.
 - For each dequeued `InferenceRequest`:
-  - Encodes `req.prompt` using `self.tokenizer.tokenizer(req.prompt, return_tensors='pt')`.
-  - Moves `encoded['input_ids']` and `encoded['attention_mask']` to `self.engine.device`.
-  - Assigns `req.input_ids`, `req.attention_mask`, and sets `req.past = None`.
+- Applies a chat prompt template if the tokenizer exposes `apply_chat_template()`, otherwise encodes the raw prompt.
+- Encodes the resulting text using `self.tokenizer.tokenizer(..., return_tensors='pt')`.
+- Moves `encoded['input_ids']` and `encoded['attention_mask']` to `self.engine.device`.
+- Assigns `req.input_ids`, `req.attention_mask`, sets `req.past = None`, and initializes `req.seq_length` to the prompt length.
   - Appends the request to `self.active_requests`.
 
 Low-level detail:
@@ -320,9 +324,10 @@ Initial full prompt pass:
 - Returns `past_key_values = None`.
 
 Subsequent incremental pass:
-- If all active requests have a non-`None` `past`, the scheduler only sends the last generated token per request.
-- Uses `input_tensors = [r.input_ids[:, -1:] for r in self.active_requests]`.
-- Uses `attention_mask = torch.cat([r.attention_mask[:, -1:] ...], dim=0)`.
+- If all active requests have a non-`None` `past`, the scheduler sends only the last generated token per request as `input_ids`.
+- Builds a full-length attention mask for each request that covers the entire generated sequence so far, rather than only the newest token.
+- Uses per-request `req.seq_length` tracking to reconstruct attention masks for KV-cached inference.
+- Pads these full-length masks across the batch and concatenates them before forwarding to the model.
 - Stacks request `past` caches across batch dimension using `DynamicCache(ddp_cache_data=batched_past_layers, config=self.engine.model.config)`.
 
 Dynamic cache stacking:
@@ -405,6 +410,32 @@ Low-level reliability notes:
 ### `scheduler/batch_scheduler.py`
 
 This module implements the non-streaming batch endpoint and metrics collection.
+
+### `streaming/stream_manager.py`
+
+This module handles SSE token decoding and controls how text deltas are emitted to the client.
+
+Imports:
+- `asyncio`
+- `AsyncGenerator` from `typing`
+- `InferenceRequest` from `scheduler.request`
+- `tokenizer_service` from `tokenizer.tokenizer_service`
+- `logging_settings` from `settings.settings`
+- `setup_logger` from `logger`
+
+Streaming behavior:
+- Reads token IDs from `req.queue` until the sentinel `"[DONE]"` is received.
+- Decodes the whole token sequence so far using `tokenizer_service.decode(tokens)`.
+- Strips incomplete UTF-8 replacement characters from the decoded output.
+- Buffers decoded text and emits updates only when a natural boundary is reached:
+  - whitespace at the end of the buffered delta,
+  - punctuation characters like `.,;:!?`,
+  - or when the buffered delta reaches a fixed length threshold.
+- Skips explicit special token IDs when the tokenizer exposes `all_special_ids`.
+
+This reduces noisy subword chunks and produces cleaner SSE text fragments for clients.
+
+### `scheduler/batch_scheduler.py`
 
 Imports typically include:
 - `asyncio`
@@ -587,9 +618,12 @@ Imports:
 `ModelSetting`:
 - Loads YAML from `settings/config.yaml`.
 - Reads `model_config.defaults`.
+- Resolves the configured `device` value through `resolve_device()`:
+  - `"auto"` → auto-detects the best available device: MPS (Apple Silicon) > CUDA > CPU.
+  - Any explicit string (e.g. `"cpu"`, `"cuda:1"`, `"mps"`) is passed through unchanged.
 - Exposes:
   - `model_name`
-  - `device`
+  - `device` (resolved)
   - `max_length`
   - `temperature`
   - `top_k`
@@ -615,7 +649,7 @@ Global instances:
 
 Default configuration:
 - `model_name: "openai-community/gpt2-medium"`
-- `device: "cpu"`
+- `device: "auto"` — auto-detects MPS (Apple Silicon), then CUDA, then CPU
 - `max_length: 20`
 - `temperature: 0.5`
 - `top_k: 8`
@@ -627,7 +661,7 @@ Default configuration:
 
 Notes:
 - The model name is easily replaceable with any compatible causal language model.
-- The device can be switched to `cuda` on GPU-enabled hosts.
+- The device field supports `"auto"`, `"cpu"`, `"cuda"`, `"cuda:1"`, or `"mps"`. Use `"auto"` to let the server pick the best available device at runtime.
 
 ---
 
@@ -741,14 +775,18 @@ The SSE pipeline yields decoded text fragments, not token IDs. Each event is pro
 
 ---
 
-## Observations and Recommended Improvements
+## Completed Improvements & Current Observations
 
-Potential areas for improvement:
-- Add explicit request cancellation support for long-running or aborted clients.
-- Add request timeout semantics to avoid stuck active requests.
-- Expose batch-size, queue latency, and token throughput metrics.
+Key improvements that have been implemented:
+- **Request Cancellation**: Supported client-disconnect detection and request cancellation for batch generation.
+- **Request Timeouts**: Supported 20-second schedule deadlines and 25-second generation timeouts.
+- **Runtime Metrics**: Implemented queue latency, batch size, and token throughput tracking, exposed via the `/api/metrics` endpoint.
+- **Batch Compaction Fix**: Fixed the bug in `InferenceEngine.generate_batch` where `active_requests` was not subsetted during compaction.
+- **Sliding-Window Token Streaming**: Upgraded the streaming response generator to decode incrementally and strip trailing Unicode replacement characters (`\ufffd`) at token boundaries to prevent character corruption.
+- **Apple Silicon (MPS) Support**: Added automatic device resolution (`"auto"` mode) that detects MPS, CUDA, or CPU at startup. Models load with `float16` on MPS to avoid memory issues. Fixed a cross-device tensor indexing bug in repetition penalty logic (`torch.unique()` returns CPU tensors on MPS, now explicitly moved to the correct device).
+
+Future areas for improvement:
 - Consider using a dedicated `IncomingRequest` object for prompt validation and sanitization.
-- Fix the indentation bug in `engine/generator.py` batch compaction logic.
 
 ---
 
@@ -775,10 +813,12 @@ Potential areas for improvement:
 
 ### `streaming/stream_manager.py`
 
-Converts raw token IDs from a request queue into decoded SSE stream payloads.
+Converts raw token IDs from a request queue into decoded SSE stream payloads using a sliding-window decoder to prevent multi-byte character corruption.
 
 Responsibilities:
 - Consumes `req.queue` until the sentinel `"[DONE]"`.
+- Accumulates token IDs and decodes the entire sequence to yield the new text delta.
+- Strips trailing Unicode replacement characters (`\ufffd`) at token boundaries to prevent character corruption.
 - Filters out special tokens when decoding.
 - Skips empty decoded strings.
 - Yields decoded text fragments as they become available.

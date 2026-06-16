@@ -9,19 +9,16 @@ from logger import setup_logger
 logger = setup_logger(__name__, level=logging_settings.log_level, log_file=logging_settings.log_file)
 
 
-def _decode_token(token_id: int) -> str:
-    """Decode a single token ID to a string using the tokenizer service."""
-    return tokenizer_service.decode([token_id])
-
-
 async def stream_response(req: InferenceRequest) -> AsyncGenerator[str, None]:
     """Yield decoded tokens from an ``InferenceRequest``'s streaming queue.
 
     The generator reads token IDs from ``req.queue`` until the sentinel ``"[DONE]"``
-    is received, decoding each token to a string before yielding it. This provides a
-    clean, high‑level streaming API for the rest of the codebase (e.g., HTTP or
-    WebSocket handlers).
+    is received, accumulating token IDs and decoding the entire sequence to yield the
+    new text delta. This handles multi-byte character boundaries correctly.
     """
+    tokens = []
+    yielded_text = ""
+
     while True:
         token = await req.queue.get()
         logger.debug("Stream manager received token=%s for prompt=%s", token, req.prompt)
@@ -38,15 +35,31 @@ async def stream_response(req: InferenceRequest) -> AsyncGenerator[str, None]:
             logger.debug("Stream manager skipping special token=%s for prompt=%s", token, req.prompt)
             continue
 
-        decoded = _decode_token(token)
-        if decoded == "":
-            logger.debug("Stream manager decoded empty string for token=%s prompt=%s", token, req.prompt)
+        tokens.append(token)
+        current_text = tokenizer_service.decode(tokens)
+
+        # Strip trailing unicode replacement character (incomplete UTF-8 sequence)
+        clean_text = current_text
+        while clean_text.endswith("\ufffd"):
+            clean_text = clean_text[:-1]
+
+        if len(clean_text) <= len(yielded_text):
             continue
 
-        logger.debug(
-            "Stream manager decoded token=%s -> '%s' for prompt=%s",
-            token,
-            decoded,
-            req.prompt,
-        )
-        yield decoded
+        delta = clean_text[len(yielded_text):]
+        should_emit = delta.endswith(" ") or delta[-1] in ".,;:!?" or len(delta) >= 16
+
+        if should_emit:
+            yielded_text += delta
+            logger.debug(
+                "Stream manager decoded tokens -> delta '%s' for prompt=%s",
+                delta,
+                req.prompt,
+            )
+            yield delta
+        else:
+            logger.debug(
+                "Stream manager buffering partial delta '%s' for prompt=%s",
+                delta,
+                req.prompt,
+            )

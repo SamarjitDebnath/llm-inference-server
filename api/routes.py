@@ -21,25 +21,47 @@ router = APIRouter()
 
 
 @router.post("/generate")
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, request: Request):
     logger.info(
         "Received /generate request: prompt=%s max_tokens=%s temperature=%s",
         req.prompt,
         req.max_tokens,
         req.temperature,
     )
-    request = InferenceRequest(
+    inference_request = InferenceRequest(
         req.prompt,
         req.max_tokens,
         req.temperature
     )
 
     # Enqueue the request for the continuous scheduler
-    await request_queue.put(request)
+    await request_queue.put(inference_request)
     logger.debug("Enqueued inference request and returning SSE stream")
 
-    # Return an SSE stream of decoded tokens
-    return EventSourceResponse(stream_response(request))
+    async def cancel_on_disconnect() -> None:
+        """Monitor for client disconnection and cancel the request."""
+        try:
+            while not await request.is_disconnected():
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            return
+        
+        # Client disconnected; cancel the inference request
+        if not inference_request.future.done():
+            logger.info("Client disconnected; cancelling inference request")
+            inference_request.future.cancel()
+
+    cancel_task = asyncio.create_task(cancel_on_disconnect())
+    
+    try:
+        # Return an SSE stream of decoded tokens
+        return EventSourceResponse(stream_response(inference_request))
+    finally:
+        cancel_task.cancel()
+        try:
+            await cancel_task
+        except asyncio.CancelledError:
+            pass
 
 
 @router.post("/generate_batch", response_model=BatchGenerateResponse)

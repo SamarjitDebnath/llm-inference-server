@@ -1,7 +1,7 @@
 model_config:
    defaults:
-      model_name: "openai-community/gpt2-medium" # "distilgpt2" # you can change this to any compatible model like "gpt2-medium", "gpt2-large",  "TinyLlama/TinyLlama-1.1B-Chat-v1.0" etc.
-      device: "cpu" # for local testing, change to "cuda" if you have a compatible GPU
+      model_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0 # alternatives: "openai-community/gpt2-medium", "distilgpt2", "gpt2-large", "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "Qwen/Qwen2.5-0.5B"
+      device: "auto" # "auto" detects MPS (Apple Silicon), CUDA, or CPU. Override with "cpu", "cuda", or "mps" to pin a device.
       max_length: 20
       temperature: 0.5
       top_k: 8

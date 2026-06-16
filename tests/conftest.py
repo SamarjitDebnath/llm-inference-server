@@ -1,4 +1,9 @@
 """Pytest configuration and shared fixtures"""
+from utils.utils import Utils
+
+# Prevent multiprocessing/torch semaphore leaks at shutdown
+Utils.configure_multiprocessing()
+
 import asyncio
 import pytest
 from pathlib import Path

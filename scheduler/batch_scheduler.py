@@ -66,6 +66,25 @@ class BatchScheduler:
             metrics.record_queue_latency(req.queue_latency_ms)
 
         prompts = [req.prompt for req in valid_requests]
+        
+        # Apply chat template if available
+        tokenizer_obj = self.tokenizer.tokenizer
+        if hasattr(tokenizer_obj, 'apply_chat_template'):
+            try:
+                formatted_prompts = []
+                for prompt in prompts:
+                    messages = [{"role": "user", "content": prompt}]
+                    formatted = tokenizer_obj.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    formatted_prompts.append(formatted)
+                prompts = formatted_prompts
+                logger.info("Applied chat template to %d batch prompts", len(prompts))
+            except Exception as e:
+                logger.warning("Failed to apply chat template to batch: %s, using raw prompts", e)
+        
         encoded = self.tokenizer.tokenizer(
             prompts,
             return_tensors="pt",
@@ -76,6 +95,10 @@ class BatchScheduler:
 
         input_ids = encoded["input_ids"]
         attention_mask = encoded["attention_mask"]
+        
+        # Track initial sequence length for each request (for KV-cached attention masks)
+        for req, inp in zip(valid_requests, input_ids):
+            setattr(req, 'seq_length', inp.shape[0])
 
         start_time = time.monotonic()
         try:

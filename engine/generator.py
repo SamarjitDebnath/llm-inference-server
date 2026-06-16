@@ -10,10 +10,15 @@ logger = setup_logger(__name__, level=logging_settings.log_level, log_file=loggi
 class InferenceEngine:
     def __init__(self):
         self.device = model_settings.device
-        self._model = model_loader._get_model()
+        # Defer actual model retrieval/loading until first use to avoid
+        # initializing torch/model state at import time (prevents semaphore
+        # leaks and is safe with multi-worker servers).
+        self._model = None
 
     @property
     def model(self):
+        if self._model is None:
+            self._model = model_loader._get_model()
         return self._model
 
     def sample(self, logits, temperature, top_k=0, top_p=1.0):
@@ -71,6 +76,8 @@ class InferenceEngine:
             tuple(attention_mask.shape) if attention_mask is not None else None,
             type(past_key_values).__name__ if past_key_values is not None else None,
         )
+        
+        logger.info("Model device: %s, Model dtype: %s", self.model.device, self.model.dtype)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -122,7 +129,7 @@ class InferenceEngine:
             unique_tokens = torch.unique(input_ids[i])
             if unique_tokens.numel() == 0:
                 continue
-            valid_tokens = unique_tokens[unique_tokens < logits.size(-1)]
+            valid_tokens = unique_tokens[unique_tokens < logits.size(-1)].to(logits.device)
             if valid_tokens.numel() == 0:
                 continue
 
@@ -237,7 +244,7 @@ class InferenceEngine:
                         logits = logits[:, -1, :]
                     for i in range(len(active_requests)):
                         unique_tokens = torch.unique(input_ids[i])
-                        valid_tokens = unique_tokens[unique_tokens < logits.size(-1)]
+                        valid_tokens = unique_tokens[unique_tokens < logits.size(-1)].to(logits.device)
                         if valid_tokens.numel() == 0:
                             continue
                         selected_logits = logits[i, valid_tokens]
@@ -301,6 +308,8 @@ class InferenceEngine:
                     # Compact past_key_values cache
                     if past_key_values is not None:
                         past_key_values.batch_select_indices(active_indices)
+
+                    active_requests = [active_requests[idx] for idx in keep_indices]
 
             for i, req in enumerate(requests):
                 if outputs[i] is None:
