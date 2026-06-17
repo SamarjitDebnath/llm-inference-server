@@ -148,7 +148,7 @@ Contributing
 
 License
 -------
-Refer to pyproject.toml for package metadata and the LICENSE file for the applicable license terms.
+Refer to `pyproject.toml` for package metadata and the `LICENSE` file for the applicable license terms.
 
 Useful files
 ------------
